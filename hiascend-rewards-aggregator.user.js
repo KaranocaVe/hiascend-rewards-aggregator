@@ -76,7 +76,7 @@
       padding: 8px 10px;
     }
     #${PANEL_ID} .hrg-groups {
-      max-height: min(55vh, 560px);
+      max-height: max(180px, calc(min(55vh, 560px) - 72px));
       overflow: auto;
       padding-right: 2px;
     }
@@ -95,6 +95,7 @@
       grid-template-columns: minmax(0, 1fr) auto;
       list-style: none;
       padding: 10px 12px;
+      position: relative;
       user-select: none;
     }
     #${PANEL_ID} .hrg-date-summary::-webkit-details-marker { display: none; }
@@ -414,8 +415,8 @@
       const details = document.createElement('details');
       details.className = 'hrg-date-group';
       details.dataset.hrgDate = dateGroup.date;
-      // Keep the newest date immediately visible; the rest remain collapsed.
-      details.open = index === 0;
+      // Keep date groups compact by default; use “全部展开” when needed.
+      details.open = false;
 
       const summary = document.createElement('summary');
       summary.className = 'hrg-date-summary';
