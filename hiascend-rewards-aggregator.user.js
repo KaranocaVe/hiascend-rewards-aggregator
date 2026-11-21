@@ -169,8 +169,7 @@
         dialog,
         cache: new Map(),
         inFlight: new Map(),
-        requestId: 0,
-      };
+              };
     }
     return state;
   }
@@ -318,7 +317,7 @@
         dateGroup = { date, total: 0, groups: new Map(), order: result.dates.size };
         result.dates.set(date, dateGroup);
       }
-      const key = direction + '\\u0000' + description;
+      const key = direction + String.fromCharCode(0) + description;
       let group = dateGroup.groups.get(key);
       if (!group) {
         group = { description, direction, points: 0, count: 0 };
@@ -486,10 +485,16 @@
     }
   }
 
+
   function restoreOriginal(dialog) {
     dialog.dataset.hrgDisabled = 'true';
+    if (state?.dialog === dialog) {
+      for (const { controller } of state.inFlight.values()) controller.abort();
+      state.inFlight.clear();
+      state.cache.clear();
+    }
     dialog.querySelectorAll('.stone-dlg-container').forEach((element) => {
-      if (!element.closest(`#${PANEL_ID}`)) element.style.removeProperty('display');
+      if (!element.closest('#' + PANEL_ID)) element.style.removeProperty('display');
     });
     getPanel(dialog)?.remove();
   }
@@ -503,37 +508,51 @@
     const panel = ensurePanel(dialog);
     if (!panel) return;
 
-    if (!force && current.cache.has(mode)) {
-      renderData(panel, mode, current.cache.get(mode));
-      return;
+    if (force) {
+      current.inFlight.get(mode)?.controller.abort();
+      current.inFlight.delete(mode);
+      current.cache.delete(mode);
     }
-    if (current.inFlight.has(mode)) return;
+    let result = current.cache.get(mode);
+    if (!result) {
+      result = createAccumulator();
+      current.cache.set(mode, result);
+    }
+    renderData(panel, mode, result);
+    if (result.finished || result.error || current.inFlight.has(mode)) return;
 
-    const requestId = ++current.requestId;
-    renderLoading(panel, mode);
-    const promise = fetchAll(mode)
-      .then((result) => {
-        current.cache.set(mode, result);
-        if (current.dialog === dialog && dialog.isConnected && getActiveMode(dialog) === mode && requestId === current.requestId) {
-          renderData(panel, mode, result);
-        }
-        return result;
+    const controller = new AbortController();
+    const isVisible = () => state === current && current.cache.get(mode) === result
+      && dialog.isConnected && panel.isConnected && dialog.dataset.hrgDisabled !== 'true'
+      && getActiveMode(dialog) === mode;
+    const promise = fetchAll(mode, (items, pageNo, pages, totalCount) => {
+      if (controller.signal.aborted || current.cache.get(mode) !== result) return;
+      aggregatePage(result, items, pageNo, pages, totalCount);
+      if (isVisible()) renderData(panel, mode, result);
+    }, controller.signal)
+      .then(() => {
+        if (controller.signal.aborted || current.cache.get(mode) !== result) return;
+        result.finished = true;
+        if (isVisible()) renderData(panel, mode, result);
       })
       .catch((error) => {
-        if (current.dialog === dialog && dialog.isConnected && getActiveMode(dialog) === mode && requestId === current.requestId) {
-          renderError(panel, mode, error);
-        }
-        throw error;
+        if (controller.signal.aborted || current.cache.get(mode) !== result) return;
+        controller.abort();
+        result.error = error;
+        if (isVisible()) renderData(panel, mode, result);
       })
-      .finally(() => current.inFlight.delete(mode));
-    current.inFlight.set(mode, promise);
-    // The catch above renders the user-facing error; this handler prevents an unhandled rejection.
-    promise.catch(() => {});
+      .finally(() => {
+        if (current.inFlight.get(mode)?.controller === controller) current.inFlight.delete(mode);
+      });
+    current.inFlight.set(mode, { controller, promise });
   }
 
   function sync() {
     const dialog = getDialog();
     if (!dialog) {
+      if (state) {
+        for (const { controller } of state.inFlight.values()) controller.abort();
+      }
       state = null;
       return;
     }
@@ -543,13 +562,12 @@
     const panel = ensurePanel(dialog);
     if (!panel) return;
 
-    const panelMode = panel.dataset.hrgMode;
-    if (panelMode !== mode) {
+    if (panel.dataset.hrgMode !== mode || !current.cache.has(mode)) {
       loadMode(dialog, mode);
       return;
     }
-    if (panel.dataset.hrgReady === 'error' || panel.dataset.hrgReady === 'loading') return;
-    if (!current.cache.has(mode)) loadMode(dialog, mode);
+    const result = current.cache.get(mode);
+    if (!result.finished && !result.error && !current.inFlight.has(mode)) loadMode(dialog, mode);
   }
 
   function scheduleSync() {
