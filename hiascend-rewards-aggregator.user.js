@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HiAscend 积分明细聚合
 // @namespace    https://www.hiascend.com/
-// @version      1.0.0
-// @description  在昇腾社区“积分明细”弹窗中自动加载全部分页，并按日期和同类项目合并、折叠展示。
+// @version      1.1.0
+// @description  在积分明细弹窗中按分页实时汇总，第一批数据返回即可查看。
 // @match        https://www.hiascend.com/developer/rewards*
 // @run-at       document-idle
 // @grant        none
@@ -66,15 +66,8 @@
       outline: 2px solid #4679c8;
       outline-offset: 2px;
     }
-    #${PANEL_ID} .hrg-rule {
-      border: 1px solid var(--hrg-border);
-      border-radius: 8px;
-      background: var(--hrg-surface);
-      color: var(--hrg-muted);
-      font-size: 12px;
-      margin-bottom: 10px;
-      padding: 8px 10px;
-    }
+
+
     #${PANEL_ID} .hrg-groups {
       max-height: max(180px, calc(min(55vh, 560px) - 72px));
       overflow: auto;
@@ -176,8 +169,7 @@
         dialog,
         cache: new Map(),
         inFlight: new Map(),
-        requestId: 0,
-      };
+              };
     }
     return state;
   }
@@ -232,7 +224,7 @@
     return Number.isFinite(parsed) ? parsed : 0;
   }
 
-  async function requestPage(mode, pageNo, pageSize) {
+  async function requestPage(mode, pageNo, pageSize, signal) {
     const params = new URLSearchParams({
       pageNo: String(pageNo),
       pageSize: String(pageSize),
@@ -243,6 +235,7 @@
     const response = await fetch(`${location.origin}${API_PATH}?${params}`, {
       credentials: 'include',
       headers: { Accept: 'application/json' },
+      signal,
     });
     if (!response.ok) {
       throw new Error(`接口请求失败（HTTP ${response.status}）`);
@@ -256,33 +249,35 @@
     return data;
   }
 
-  async function fetchAll(mode) {
+
+  // Each page is displayed as soon as its own request resolves, including page 1.
+  // Up to four requests run concurrently; one slow page does not hold back the others.
+  async function fetchAll(mode, onPage, signal) {
     let first;
     let pageSize = PAGE_SIZE;
     try {
-      first = await requestPage(mode, 1, pageSize);
+      first = await requestPage(mode, 1, pageSize, signal);
     } catch (error) {
-      // The service has historically accepted 50 and 100, but 50 is a safe fallback.
-      if (pageSize === 50) throw error;
+      if (signal.aborted || pageSize === 50) throw error;
       pageSize = 50;
-      first = await requestPage(mode, 1, pageSize);
+      first = await requestPage(mode, 1, pageSize, signal);
     }
 
     const pages = Math.max(1, number(first.pages) || Math.ceil(number(first.totalCount) / pageSize));
-    const all = [...first.list];
-    for (let start = 2; start <= pages; start += 4) {
-      const pageNumbers = [];
-      for (let pageNo = start; pageNo < start + 4 && pageNo <= pages; pageNo += 1) {
-        pageNumbers.push(pageNo);
-      }
-      const results = await Promise.all(pageNumbers.map((pageNo) => requestPage(mode, pageNo, pageSize)));
-      results.forEach((data) => all.push(...data.list));
-    }
+    const totalCount = number(first.totalCount) || (pages === 1 ? first.list.length : null);
+    if (signal.aborted) return;
+    onPage(first.list, 1, pages, totalCount);
 
-    return {
-      items: all,
-      totalCount: number(first.totalCount) || all.length,
-    };
+    let nextPage = 2;
+    async function worker() {
+      while (!signal.aborted && nextPage <= pages) {
+        const pageNo = nextPage++;
+        const data = await requestPage(mode, pageNo, pageSize, signal);
+        if (signal.aborted) return;
+        onPage(data.list, pageNo, pages, totalCount);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(4, pages - 1) }, () => worker()));
   }
 
   function signedPoints(item) {
@@ -296,41 +291,53 @@
     return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
   }
 
-  function aggregate(items) {
-    const dateMap = new Map();
-    items.forEach((item) => {
+
+  function createAccumulator() {
+    return {
+      dates: new Map(), loadedCount: 0, mergedCount: 0, loadedPages: 0,
+      pages: 0, totalCount: null, finished: false, error: null, view: null,
+      completedPages: new Set(),
+    };
+  }
+
+  // Page order does not affect totals. Repeated pages cannot be counted twice.
+  function aggregatePage(result, items, pageNo, pages, totalCount) {
+    if (result.completedPages.has(pageNo)) return;
+    result.completedPages.add(pageNo);
+    result.pages = pages;
+    result.totalCount = totalCount;
+    result.loadedPages += 1;
+    result.loadedCount += items.length;
+    for (const item of items) {
       const date = text(item.createTime) || '未知日期';
       const description = text(item.pointsDesc) || '未命名项目';
       const direction = item.isAdd === false ? 'spend' : 'add';
-      let dateGroup = dateMap.get(date);
+      let dateGroup = result.dates.get(date);
       if (!dateGroup) {
-        dateGroup = { date, total: 0, groups: new Map(), order: dateMap.size };
-        dateMap.set(date, dateGroup);
+        dateGroup = { date, total: 0, groups: new Map(), order: result.dates.size };
+        result.dates.set(date, dateGroup);
       }
-
-      const key = `${direction}\u0000${description}`;
+      const key = direction + String.fromCharCode(0) + description;
       let group = dateGroup.groups.get(key);
       if (!group) {
         group = { description, direction, points: 0, count: 0 };
         dateGroup.groups.set(key, group);
+        result.mergedCount += 1;
       }
-      const points = signedPoints(item);
-      group.points += points;
+      const amount = signedPoints(item);
+      group.points += amount;
       group.count += 1;
-      dateGroup.total += points;
-    });
+      dateGroup.total += amount;
+    }
+  }
 
-    return [...dateMap.values()]
-      .sort((a, b) => {
-        const ad = parseDate(a.date);
-        const bd = parseDate(b.date);
-        if (Number.isFinite(ad) && Number.isFinite(bd) && ad !== bd) return bd - ad;
-        return a.order - b.order;
-      })
-      .map((dateGroup) => ({
-        ...dateGroup,
-        groups: [...dateGroup.groups.values()],
-      }));
+  function sortedDateGroups(dates) {
+    return [...dates.values()].sort((a, b) => {
+      const ad = parseDate(a.date);
+      const bd = parseDate(b.date);
+      if (Number.isFinite(ad) && Number.isFinite(bd) && ad !== bd) return bd - ad;
+      return a.order - b.order;
+    });
   }
 
   function formatPoints(value) {
@@ -359,112 +366,135 @@
     return { toolbar, title, statusText };
   }
 
-  function renderLoading(panel, mode) {
-    const { toolbar } = renderShell(panel, mode, '正在加载全部分页…', 'loading');
-    toolbar.appendChild(createButton('取消聚合显示', 'restore'));
-    const loading = document.createElement('div');
-    loading.className = 'hrg-loading';
-    loading.textContent = '正在读取全部积分明细，请稍候…';
-    panel.appendChild(loading);
-  }
 
-  function renderError(panel, mode, error) {
-    const { toolbar } = renderShell(panel, mode, '加载失败', 'error');
-    toolbar.appendChild(createButton('重新加载', 'retry'));
-    const box = document.createElement('div');
-    box.className = 'hrg-error';
-    box.textContent = `无法加载积分明细：${error?.message || error}`;
-    panel.appendChild(box);
-  }
-
+  // Reconcile changed totals into persistent DOM nodes. Never recreate a date's
+  // <details> element once mounted: open state and scroll position survive updates.
   function renderData(panel, mode, result) {
-    const groups = aggregate(result.items);
-    const mergedCount = groups.reduce((sum, group) => sum + group.groups.length, 0);
-    const { toolbar, statusText } = renderShell(
-      panel,
-      mode,
-      `已加载 ${result.items.length} 条，合并为 ${mergedCount} 项，${groups.length} 个日期`,
-    );
-    toolbar.querySelector('.hrg-actions')?.remove();
-    const actions = document.createElement('div');
-    actions.className = 'hrg-actions';
-    actions.append(
-      createButton('全部展开', 'expand'),
-      createButton('全部折叠', 'collapse'),
-      createButton('重新加载', 'retry'),
-      createButton('原始明细', 'restore'),
-    );
-    toolbar.appendChild(actions);
-
-    const rule = document.createElement('div');
-    rule.className = 'hrg-rule';
-    rule.textContent = '聚合规则：同一天内按描述和收支方向合并积分；括号内为原始记录条数。';
-    panel.appendChild(rule);
-
-    const list = document.createElement('div');
-    list.className = 'hrg-groups';
-    list.setAttribute('role', 'list');
-    if (!groups.length) {
-      const empty = document.createElement('div');
-      empty.className = 'hrg-empty';
-      empty.textContent = `暂无“${MODE_LABELS[mode]}”明细`;
-      list.appendChild(empty);
+    let view = result.view;
+    if (!view || view.panel !== panel || view.mode !== mode || view.list.parentElement !== panel) {
+      const shell = renderShell(panel, mode, '正在读取第 1 页…', 'loading');
+      const actions = document.createElement('div');
+      actions.className = 'hrg-actions';
+      actions.append(
+        createButton('全部展开', 'expand'),
+        createButton('全部折叠', 'collapse'),
+        createButton('重新加载', 'retry'),
+        createButton('原始明细', 'restore'),
+      );
+      shell.toolbar.appendChild(actions);
+      const list = document.createElement('div');
+      list.className = 'hrg-groups';
+      list.setAttribute('role', 'list');
+      panel.appendChild(list);
+      view = { panel, mode, statusText: shell.statusText, list, dates: new Map(), notice: null };
+      result.view = view;
     }
 
-    groups.forEach((dateGroup, index) => {
-      const details = document.createElement('details');
-      details.className = 'hrg-date-group';
-      details.dataset.hrgDate = dateGroup.date;
-      // Keep date groups compact by default; use “全部展开” when needed.
-      details.open = false;
+    let addedDate = false;
+    for (const dateGroup of result.dates.values()) {
+      let dateView = view.dates.get(dateGroup.date);
+      if (!dateView) {
+        const details = document.createElement('details');
+        details.className = 'hrg-date-group';
+        details.dataset.hrgDate = dateGroup.date;
+        details.open = false;
+        const summary = document.createElement('summary');
+        summary.className = 'hrg-date-summary';
+        const dateLabel = document.createElement('span');
+        dateLabel.className = 'hrg-date-label';
+        dateLabel.textContent = dateGroup.date;
+        const dateMeta = document.createElement('span');
+        dateMeta.className = 'hrg-date-meta';
+        summary.append(dateLabel, dateMeta);
+        details.appendChild(summary);
+        const rows = document.createElement('div');
+        rows.className = 'hrg-rows';
+        rows.setAttribute('role', 'list');
+        details.appendChild(rows);
+        dateView = { details, dateMeta, rows, groups: new Map() };
+        view.dates.set(dateGroup.date, dateView);
+        addedDate = true;
+      }
+      const meta = formatPoints(dateGroup.total) + ' · ' + dateGroup.groups.size + ' 项';
+      if (dateView.dateMeta.textContent !== meta) dateView.dateMeta.textContent = meta;
+      for (const [key, group] of dateGroup.groups) {
+        let rowView = dateView.groups.get(key);
+        if (!rowView) {
+          const row = document.createElement('div');
+          row.className = 'hrg-row';
+          row.setAttribute('role', 'listitem');
+          const description = document.createElement('span');
+          description.className = 'hrg-description';
+          description.textContent = group.description;
+          description.title = group.description;
+          const points = document.createElement('span');
+          points.className = 'hrg-points ' + (group.direction === 'add' ? 'is-add' : 'is-spend');
+          const count = document.createElement('span');
+          count.className = 'hrg-count';
+          row.append(description, points, count);
+          dateView.rows.appendChild(row);
+          rowView = { points, count };
+          dateView.groups.set(key, rowView);
+        }
+        const formatted = formatPoints(group.points);
+        if (rowView.points.textContent !== formatted) rowView.points.textContent = formatted;
+        const countText = '×' + group.count;
+        if (rowView.count.textContent !== countText) {
+          rowView.count.textContent = countText;
+          rowView.count.title = group.count + ' 条原始记录';
+        }
+      }
+    }
 
-      const summary = document.createElement('summary');
-      summary.className = 'hrg-date-summary';
-      const dateLabel = document.createElement('span');
-      dateLabel.className = 'hrg-date-label';
-      dateLabel.textContent = dateGroup.date;
-      const dateMeta = document.createElement('span');
-      dateMeta.className = 'hrg-date-meta';
-      dateMeta.textContent = `${formatPoints(dateGroup.total)} · ${dateGroup.groups.length} 项`;
-      summary.append(dateLabel, dateMeta);
-      details.appendChild(summary);
+    if (addedDate) {
+      let position = view.list.firstElementChild;
+      for (const dateGroup of sortedDateGroups(result.dates)) {
+        const details = view.dates.get(dateGroup.date).details;
+        if (details === position) position = position.nextElementSibling;
+        else view.list.insertBefore(details, position);
+      }
+    }
 
-      const rows = document.createElement('div');
-      rows.className = 'hrg-rows';
-      rows.setAttribute('role', 'list');
-      dateGroup.groups.forEach((group) => {
-        const row = document.createElement('div');
-        row.className = 'hrg-row';
-        row.setAttribute('role', 'listitem');
-        const description = document.createElement('span');
-        description.className = 'hrg-description';
-        description.textContent = group.description;
-        description.title = group.description;
-        const points = document.createElement('span');
-        points.className = `hrg-points ${group.direction === 'add' ? 'is-add' : 'is-spend'}`;
-        points.textContent = formatPoints(group.points);
-        const count = document.createElement('span');
-        count.className = 'hrg-count';
-        count.textContent = `×${group.count}`;
-        count.title = `${group.count} 条原始记录`;
-        row.append(description, points, count);
-        rows.appendChild(row);
-      });
-      details.appendChild(rows);
-      list.appendChild(details);
-    });
-    panel.appendChild(list);
+    const total = result.totalCount == null ? '' : ' / ' + result.totalCount;
+    if (result.error) {
+      view.statusText.textContent = '读取失败 · 已汇总 ' + result.loadedCount + total + ' 条';
+    } else {
+      view.statusText.textContent = (result.finished ? '已完成' : '正在加载')
+        + ' · ' + result.loadedPages + ' / ' + (result.pages || '?') + ' 页'
+        + ' · ' + result.loadedCount + total + ' 条'
+        + ' · ' + result.mergedCount + ' 项 · ' + result.dates.size + ' 天';
+    }
+    view.statusText.title = result.totalCount == null ? '' : result.totalCount + ' 条接口记录';
+    panel.dataset.hrgRawCount = String(result.loadedCount);
+    panel.dataset.hrgMergedCount = String(result.mergedCount);
+    panel.dataset.hrgReady = result.error ? 'error' : result.finished ? 'ready' : 'loading';
 
-    // Keep the result accessible to page-level diagnostics without exposing raw records in the DOM.
-    panel.dataset.hrgRawCount = String(result.items.length);
-    panel.dataset.hrgMergedCount = String(mergedCount);
-    statusText.title = `${result.totalCount} 条接口记录`;
+    const message = result.error ? '读取失败：' + (result.error.message || result.error) + '。可点击“重新加载”重试。'
+      : result.finished && !result.dates.size ? '暂无“' + MODE_LABELS[mode] + '”明细'
+      : result.loadedPages === 0 ? '正在读取第 1 页…' : '';
+    if (message) {
+      if (!view.notice) {
+        view.notice = document.createElement('div');
+        view.list.appendChild(view.notice);
+      }
+      view.notice.className = result.error ? 'hrg-error' : result.finished ? 'hrg-empty' : 'hrg-loading';
+      view.notice.textContent = message;
+    } else if (view.notice) {
+      view.notice.remove();
+      view.notice = null;
+    }
   }
+
 
   function restoreOriginal(dialog) {
     dialog.dataset.hrgDisabled = 'true';
+    if (state?.dialog === dialog) {
+      for (const { controller } of state.inFlight.values()) controller.abort();
+      state.inFlight.clear();
+      state.cache.clear();
+    }
     dialog.querySelectorAll('.stone-dlg-container').forEach((element) => {
-      if (!element.closest(`#${PANEL_ID}`)) element.style.removeProperty('display');
+      if (!element.closest('#' + PANEL_ID)) element.style.removeProperty('display');
     });
     getPanel(dialog)?.remove();
   }
@@ -478,37 +508,51 @@
     const panel = ensurePanel(dialog);
     if (!panel) return;
 
-    if (!force && current.cache.has(mode)) {
-      renderData(panel, mode, current.cache.get(mode));
-      return;
+    if (force) {
+      current.inFlight.get(mode)?.controller.abort();
+      current.inFlight.delete(mode);
+      current.cache.delete(mode);
     }
-    if (current.inFlight.has(mode)) return;
+    let result = current.cache.get(mode);
+    if (!result) {
+      result = createAccumulator();
+      current.cache.set(mode, result);
+    }
+    renderData(panel, mode, result);
+    if (result.finished || result.error || current.inFlight.has(mode)) return;
 
-    const requestId = ++current.requestId;
-    renderLoading(panel, mode);
-    const promise = fetchAll(mode)
-      .then((result) => {
-        current.cache.set(mode, result);
-        if (current.dialog === dialog && dialog.isConnected && getActiveMode(dialog) === mode && requestId === current.requestId) {
-          renderData(panel, mode, result);
-        }
-        return result;
+    const controller = new AbortController();
+    const isVisible = () => state === current && current.cache.get(mode) === result
+      && dialog.isConnected && panel.isConnected && dialog.dataset.hrgDisabled !== 'true'
+      && getActiveMode(dialog) === mode;
+    const promise = fetchAll(mode, (items, pageNo, pages, totalCount) => {
+      if (controller.signal.aborted || current.cache.get(mode) !== result) return;
+      aggregatePage(result, items, pageNo, pages, totalCount);
+      if (isVisible()) renderData(panel, mode, result);
+    }, controller.signal)
+      .then(() => {
+        if (controller.signal.aborted || current.cache.get(mode) !== result) return;
+        result.finished = true;
+        if (isVisible()) renderData(panel, mode, result);
       })
       .catch((error) => {
-        if (current.dialog === dialog && dialog.isConnected && getActiveMode(dialog) === mode && requestId === current.requestId) {
-          renderError(panel, mode, error);
-        }
-        throw error;
+        if (controller.signal.aborted || current.cache.get(mode) !== result) return;
+        controller.abort();
+        result.error = error;
+        if (isVisible()) renderData(panel, mode, result);
       })
-      .finally(() => current.inFlight.delete(mode));
-    current.inFlight.set(mode, promise);
-    // The catch above renders the user-facing error; this handler prevents an unhandled rejection.
-    promise.catch(() => {});
+      .finally(() => {
+        if (current.inFlight.get(mode)?.controller === controller) current.inFlight.delete(mode);
+      });
+    current.inFlight.set(mode, { controller, promise });
   }
 
   function sync() {
     const dialog = getDialog();
     if (!dialog) {
+      if (state) {
+        for (const { controller } of state.inFlight.values()) controller.abort();
+      }
       state = null;
       return;
     }
@@ -518,13 +562,12 @@
     const panel = ensurePanel(dialog);
     if (!panel) return;
 
-    const panelMode = panel.dataset.hrgMode;
-    if (panelMode !== mode) {
+    if (panel.dataset.hrgMode !== mode || !current.cache.has(mode)) {
       loadMode(dialog, mode);
       return;
     }
-    if (panel.dataset.hrgReady === 'error' || panel.dataset.hrgReady === 'loading') return;
-    if (!current.cache.has(mode)) loadMode(dialog, mode);
+    const result = current.cache.get(mode);
+    if (!result.finished && !result.error && !current.inFlight.has(mode)) loadMode(dialog, mode);
   }
 
   function scheduleSync() {
