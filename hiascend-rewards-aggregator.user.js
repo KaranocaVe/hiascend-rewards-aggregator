@@ -367,106 +367,123 @@
     return { toolbar, title, statusText };
   }
 
-  function renderLoading(panel, mode) {
-    const { toolbar } = renderShell(panel, mode, '正在加载全部分页…', 'loading');
-    toolbar.appendChild(createButton('取消聚合显示', 'restore'));
-    const loading = document.createElement('div');
-    loading.className = 'hrg-loading';
-    loading.textContent = '正在读取全部积分明细，请稍候…';
-    panel.appendChild(loading);
-  }
 
-  function renderError(panel, mode, error) {
-    const { toolbar } = renderShell(panel, mode, '加载失败', 'error');
-    toolbar.appendChild(createButton('重新加载', 'retry'));
-    const box = document.createElement('div');
-    box.className = 'hrg-error';
-    box.textContent = `无法加载积分明细：${error?.message || error}`;
-    panel.appendChild(box);
-  }
-
+  // Reconcile changed totals into persistent DOM nodes. Never recreate a date's
+  // <details> element once mounted: open state and scroll position survive updates.
   function renderData(panel, mode, result) {
-    const groups = aggregate(result.items);
-    const mergedCount = groups.reduce((sum, group) => sum + group.groups.length, 0);
-    const { toolbar, statusText } = renderShell(
-      panel,
-      mode,
-      `已加载 ${result.items.length} 条，合并为 ${mergedCount} 项，${groups.length} 个日期`,
-    );
-    toolbar.querySelector('.hrg-actions')?.remove();
-    const actions = document.createElement('div');
-    actions.className = 'hrg-actions';
-    actions.append(
-      createButton('全部展开', 'expand'),
-      createButton('全部折叠', 'collapse'),
-      createButton('重新加载', 'retry'),
-      createButton('原始明细', 'restore'),
-    );
-    toolbar.appendChild(actions);
-
-    const rule = document.createElement('div');
-    rule.className = 'hrg-rule';
-    rule.textContent = '聚合规则：同一天内按描述和收支方向合并积分；括号内为原始记录条数。';
-    panel.appendChild(rule);
-
-    const list = document.createElement('div');
-    list.className = 'hrg-groups';
-    list.setAttribute('role', 'list');
-    if (!groups.length) {
-      const empty = document.createElement('div');
-      empty.className = 'hrg-empty';
-      empty.textContent = `暂无“${MODE_LABELS[mode]}”明细`;
-      list.appendChild(empty);
+    let view = result.view;
+    if (!view || view.panel !== panel || view.mode !== mode || view.list.parentElement !== panel) {
+      const shell = renderShell(panel, mode, '正在读取第 1 页…', 'loading');
+      const actions = document.createElement('div');
+      actions.className = 'hrg-actions';
+      actions.append(
+        createButton('全部展开', 'expand'),
+        createButton('全部折叠', 'collapse'),
+        createButton('重新加载', 'retry'),
+        createButton('原始明细', 'restore'),
+      );
+      shell.toolbar.appendChild(actions);
+      const list = document.createElement('div');
+      list.className = 'hrg-groups';
+      list.setAttribute('role', 'list');
+      panel.appendChild(list);
+      view = { panel, mode, statusText: shell.statusText, list, dates: new Map(), notice: null };
+      result.view = view;
     }
 
-    groups.forEach((dateGroup, index) => {
-      const details = document.createElement('details');
-      details.className = 'hrg-date-group';
-      details.dataset.hrgDate = dateGroup.date;
-      // Keep date groups compact by default; use “全部展开” when needed.
-      details.open = false;
+    let addedDate = false;
+    for (const dateGroup of result.dates.values()) {
+      let dateView = view.dates.get(dateGroup.date);
+      if (!dateView) {
+        const details = document.createElement('details');
+        details.className = 'hrg-date-group';
+        details.dataset.hrgDate = dateGroup.date;
+        details.open = false;
+        const summary = document.createElement('summary');
+        summary.className = 'hrg-date-summary';
+        const dateLabel = document.createElement('span');
+        dateLabel.className = 'hrg-date-label';
+        dateLabel.textContent = dateGroup.date;
+        const dateMeta = document.createElement('span');
+        dateMeta.className = 'hrg-date-meta';
+        summary.append(dateLabel, dateMeta);
+        details.appendChild(summary);
+        const rows = document.createElement('div');
+        rows.className = 'hrg-rows';
+        rows.setAttribute('role', 'list');
+        details.appendChild(rows);
+        dateView = { details, dateMeta, rows, groups: new Map() };
+        view.dates.set(dateGroup.date, dateView);
+        addedDate = true;
+      }
+      const meta = formatPoints(dateGroup.total) + ' · ' + dateGroup.groups.size + ' 项';
+      if (dateView.dateMeta.textContent !== meta) dateView.dateMeta.textContent = meta;
+      for (const [key, group] of dateGroup.groups) {
+        let rowView = dateView.groups.get(key);
+        if (!rowView) {
+          const row = document.createElement('div');
+          row.className = 'hrg-row';
+          row.setAttribute('role', 'listitem');
+          const description = document.createElement('span');
+          description.className = 'hrg-description';
+          description.textContent = group.description;
+          description.title = group.description;
+          const points = document.createElement('span');
+          points.className = 'hrg-points ' + (group.direction === 'add' ? 'is-add' : 'is-spend');
+          const count = document.createElement('span');
+          count.className = 'hrg-count';
+          row.append(description, points, count);
+          dateView.rows.appendChild(row);
+          rowView = { points, count };
+          dateView.groups.set(key, rowView);
+        }
+        const formatted = formatPoints(group.points);
+        if (rowView.points.textContent !== formatted) rowView.points.textContent = formatted;
+        const countText = '×' + group.count;
+        if (rowView.count.textContent !== countText) {
+          rowView.count.textContent = countText;
+          rowView.count.title = group.count + ' 条原始记录';
+        }
+      }
+    }
 
-      const summary = document.createElement('summary');
-      summary.className = 'hrg-date-summary';
-      const dateLabel = document.createElement('span');
-      dateLabel.className = 'hrg-date-label';
-      dateLabel.textContent = dateGroup.date;
-      const dateMeta = document.createElement('span');
-      dateMeta.className = 'hrg-date-meta';
-      dateMeta.textContent = `${formatPoints(dateGroup.total)} · ${dateGroup.groups.length} 项`;
-      summary.append(dateLabel, dateMeta);
-      details.appendChild(summary);
+    if (addedDate) {
+      let position = view.list.firstElementChild;
+      for (const dateGroup of sortedDateGroups(result.dates)) {
+        const details = view.dates.get(dateGroup.date).details;
+        if (details === position) position = position.nextElementSibling;
+        else view.list.insertBefore(details, position);
+      }
+    }
 
-      const rows = document.createElement('div');
-      rows.className = 'hrg-rows';
-      rows.setAttribute('role', 'list');
-      dateGroup.groups.forEach((group) => {
-        const row = document.createElement('div');
-        row.className = 'hrg-row';
-        row.setAttribute('role', 'listitem');
-        const description = document.createElement('span');
-        description.className = 'hrg-description';
-        description.textContent = group.description;
-        description.title = group.description;
-        const points = document.createElement('span');
-        points.className = `hrg-points ${group.direction === 'add' ? 'is-add' : 'is-spend'}`;
-        points.textContent = formatPoints(group.points);
-        const count = document.createElement('span');
-        count.className = 'hrg-count';
-        count.textContent = `×${group.count}`;
-        count.title = `${group.count} 条原始记录`;
-        row.append(description, points, count);
-        rows.appendChild(row);
-      });
-      details.appendChild(rows);
-      list.appendChild(details);
-    });
-    panel.appendChild(list);
+    const total = result.totalCount == null ? '' : ' / ' + result.totalCount;
+    if (result.error) {
+      view.statusText.textContent = '读取失败 · 已汇总 ' + result.loadedCount + total + ' 条';
+    } else {
+      view.statusText.textContent = (result.finished ? '已完成' : '正在加载')
+        + ' · ' + result.loadedPages + ' / ' + (result.pages || '?') + ' 页'
+        + ' · ' + result.loadedCount + total + ' 条'
+        + ' · ' + result.mergedCount + ' 项 · ' + result.dates.size + ' 天';
+    }
+    view.statusText.title = result.totalCount == null ? '' : result.totalCount + ' 条接口记录';
+    panel.dataset.hrgRawCount = String(result.loadedCount);
+    panel.dataset.hrgMergedCount = String(result.mergedCount);
+    panel.dataset.hrgReady = result.error ? 'error' : result.finished ? 'ready' : 'loading';
 
-    // Keep the result accessible to page-level diagnostics without exposing raw records in the DOM.
-    panel.dataset.hrgRawCount = String(result.items.length);
-    panel.dataset.hrgMergedCount = String(mergedCount);
-    statusText.title = `${result.totalCount} 条接口记录`;
+    const message = result.error ? '读取失败：' + (result.error.message || result.error) + '。可点击“重新加载”重试。'
+      : result.finished && !result.dates.size ? '暂无“' + MODE_LABELS[mode] + '”明细'
+      : result.loadedPages === 0 ? '正在读取第 1 页…' : '';
+    if (message) {
+      if (!view.notice) {
+        view.notice = document.createElement('div');
+        view.list.appendChild(view.notice);
+      }
+      view.notice.className = result.error ? 'hrg-error' : result.finished ? 'hrg-empty' : 'hrg-loading';
+      view.notice.textContent = message;
+    } else if (view.notice) {
+      view.notice.remove();
+      view.notice = null;
+    }
   }
 
   function restoreOriginal(dialog) {
