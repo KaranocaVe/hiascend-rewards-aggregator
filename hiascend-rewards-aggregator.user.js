@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HiAscend 积分明细聚合
 // @namespace    https://www.hiascend.com/
-// @version      1.0.0
-// @description  在昇腾社区“积分明细”弹窗中自动加载全部分页，并按日期和同类项目合并、折叠展示。
+// @version      1.1.0
+// @description  在积分明细弹窗中按分页实时汇总，第一批数据返回即可查看。
 // @match        https://www.hiascend.com/developer/rewards*
 // @run-at       document-idle
 // @grant        none
@@ -66,15 +66,8 @@
       outline: 2px solid #4679c8;
       outline-offset: 2px;
     }
-    #${PANEL_ID} .hrg-rule {
-      border: 1px solid var(--hrg-border);
-      border-radius: 8px;
-      background: var(--hrg-surface);
-      color: var(--hrg-muted);
-      font-size: 12px;
-      margin-bottom: 10px;
-      padding: 8px 10px;
-    }
+
+
     #${PANEL_ID} .hrg-groups {
       max-height: max(180px, calc(min(55vh, 560px) - 72px));
       overflow: auto;
@@ -232,7 +225,7 @@
     return Number.isFinite(parsed) ? parsed : 0;
   }
 
-  async function requestPage(mode, pageNo, pageSize) {
+  async function requestPage(mode, pageNo, pageSize, signal) {
     const params = new URLSearchParams({
       pageNo: String(pageNo),
       pageSize: String(pageSize),
@@ -243,6 +236,7 @@
     const response = await fetch(`${location.origin}${API_PATH}?${params}`, {
       credentials: 'include',
       headers: { Accept: 'application/json' },
+      signal,
     });
     if (!response.ok) {
       throw new Error(`接口请求失败（HTTP ${response.status}）`);
@@ -256,33 +250,35 @@
     return data;
   }
 
-  async function fetchAll(mode) {
+
+  // Each page is displayed as soon as its own request resolves, including page 1.
+  // Up to four requests run concurrently; one slow page does not hold back the others.
+  async function fetchAll(mode, onPage, signal) {
     let first;
     let pageSize = PAGE_SIZE;
     try {
-      first = await requestPage(mode, 1, pageSize);
+      first = await requestPage(mode, 1, pageSize, signal);
     } catch (error) {
-      // The service has historically accepted 50 and 100, but 50 is a safe fallback.
-      if (pageSize === 50) throw error;
+      if (signal.aborted || pageSize === 50) throw error;
       pageSize = 50;
-      first = await requestPage(mode, 1, pageSize);
+      first = await requestPage(mode, 1, pageSize, signal);
     }
 
     const pages = Math.max(1, number(first.pages) || Math.ceil(number(first.totalCount) / pageSize));
-    const all = [...first.list];
-    for (let start = 2; start <= pages; start += 4) {
-      const pageNumbers = [];
-      for (let pageNo = start; pageNo < start + 4 && pageNo <= pages; pageNo += 1) {
-        pageNumbers.push(pageNo);
-      }
-      const results = await Promise.all(pageNumbers.map((pageNo) => requestPage(mode, pageNo, pageSize)));
-      results.forEach((data) => all.push(...data.list));
-    }
+    const totalCount = number(first.totalCount) || (pages === 1 ? first.list.length : null);
+    if (signal.aborted) return;
+    onPage(first.list, 1, pages, totalCount);
 
-    return {
-      items: all,
-      totalCount: number(first.totalCount) || all.length,
-    };
+    let nextPage = 2;
+    async function worker() {
+      while (!signal.aborted && nextPage <= pages) {
+        const pageNo = nextPage++;
+        const data = await requestPage(mode, pageNo, pageSize, signal);
+        if (signal.aborted) return;
+        onPage(data.list, pageNo, pages, totalCount);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(4, pages - 1) }, () => worker()));
   }
 
   function signedPoints(item) {
@@ -296,41 +292,53 @@
     return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
   }
 
-  function aggregate(items) {
-    const dateMap = new Map();
-    items.forEach((item) => {
+
+  function createAccumulator() {
+    return {
+      dates: new Map(), loadedCount: 0, mergedCount: 0, loadedPages: 0,
+      pages: 0, totalCount: null, finished: false, error: null, view: null,
+      completedPages: new Set(),
+    };
+  }
+
+  // Page order does not affect totals. Repeated pages cannot be counted twice.
+  function aggregatePage(result, items, pageNo, pages, totalCount) {
+    if (result.completedPages.has(pageNo)) return;
+    result.completedPages.add(pageNo);
+    result.pages = pages;
+    result.totalCount = totalCount;
+    result.loadedPages += 1;
+    result.loadedCount += items.length;
+    for (const item of items) {
       const date = text(item.createTime) || '未知日期';
       const description = text(item.pointsDesc) || '未命名项目';
       const direction = item.isAdd === false ? 'spend' : 'add';
-      let dateGroup = dateMap.get(date);
+      let dateGroup = result.dates.get(date);
       if (!dateGroup) {
-        dateGroup = { date, total: 0, groups: new Map(), order: dateMap.size };
-        dateMap.set(date, dateGroup);
+        dateGroup = { date, total: 0, groups: new Map(), order: result.dates.size };
+        result.dates.set(date, dateGroup);
       }
-
-      const key = `${direction}\u0000${description}`;
+      const key = direction + '\\u0000' + description;
       let group = dateGroup.groups.get(key);
       if (!group) {
         group = { description, direction, points: 0, count: 0 };
         dateGroup.groups.set(key, group);
+        result.mergedCount += 1;
       }
-      const points = signedPoints(item);
-      group.points += points;
+      const amount = signedPoints(item);
+      group.points += amount;
       group.count += 1;
-      dateGroup.total += points;
-    });
+      dateGroup.total += amount;
+    }
+  }
 
-    return [...dateMap.values()]
-      .sort((a, b) => {
-        const ad = parseDate(a.date);
-        const bd = parseDate(b.date);
-        if (Number.isFinite(ad) && Number.isFinite(bd) && ad !== bd) return bd - ad;
-        return a.order - b.order;
-      })
-      .map((dateGroup) => ({
-        ...dateGroup,
-        groups: [...dateGroup.groups.values()],
-      }));
+  function sortedDateGroups(dates) {
+    return [...dates.values()].sort((a, b) => {
+      const ad = parseDate(a.date);
+      const bd = parseDate(b.date);
+      if (Number.isFinite(ad) && Number.isFinite(bd) && ad !== bd) return bd - ad;
+      return a.order - b.order;
+    });
   }
 
   function formatPoints(value) {
